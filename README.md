@@ -50,8 +50,8 @@ Run a script without the interactive shell by supplying identifiers and paramete
 ```bash
 python3 -m asio_app.tui \
   --headless \
-  --company "tfournet" \
-  --endpoint "fdb6df8c-4856-47ac-98a2-2e41a91e91f0" \
+  --company "Clucktoso" \
+  --endpoint "fdb6df8c-48bb-47ac-98a2-2f41aa1eb1f0" \
   --script "Rewst Test" \
   --param body="Write-Host \"Hello\"" \
   --param expectedExecutionTimeSec=120
