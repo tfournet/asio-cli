@@ -42,3 +42,19 @@ You will see an `asio>` prompt. Available commands:
 The TUI prints API responses using Rich tables, so you can copy IDs into follow-up commands. Toggle `debug` within the shell to stream full HTTP requests/responses (with sensitive headers masked). For deeper troubleshooting or payload examples, refer back to `example.md`.
 
 ![Asio Commands TUI screenshot](./asio-tui-screenshot.png)
+
+### Headless Mode
+
+Run a script without the interactive shell by supplying identifiers and parameters on the command line:
+
+```bash
+python3 -m asio_app.tui \
+  --headless \
+  --company "tfournet" \
+  --endpoint "fdb6df8c-4856-47ac-98a2-2e41a91e91f0" \
+  --script "Rewst Test" \
+  --param body="Write-Host \"Hello\"" \
+  --param expectedExecutionTimeSec=120
+```
+
+Use `--params-json` or `--params-file` to pass structured payloads. Add `--no-watch` to skip waiting for completion after scheduling.

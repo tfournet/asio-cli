@@ -4,7 +4,9 @@ import argparse
 import json
 import shlex
 import time
+from argparse import Namespace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from prompt_toolkit import PromptSession
@@ -1054,6 +1056,150 @@ Commands:
             return sample_dict
         return params or None
 
+    # ------------------------------------------------------------------
+    # Headless helpers
+    def run_headless(self, args: Namespace) -> None:
+        if not args.company or not args.endpoint or not args.script:
+            raise ValueError("--company, --endpoint, and --script are required in headless mode")
+
+        company = self._resolve_company(args.company)
+        if not company:
+            raise ValueError(f"Could not resolve company '{args.company}'")
+        company_id = str(company.get("id", ""))
+
+        endpoint = self._resolve_endpoint_identifier(company_id, args.endpoint)
+        if not endpoint:
+            raise ValueError(f"Could not resolve endpoint '{args.endpoint}' for company {company_id}")
+
+        script = self._resolve_script_identifier(args.script)
+        if not script:
+            raise ValueError(f"Could not resolve script '{args.script}'")
+
+        provided_params = self._parse_headless_parameters(args)
+        user_parameters = self._collect_headless_parameters(script, provided_params)
+
+        task_name = args.task_name or script.get("name") or "Automation Task"
+        self.console.print(f"Scheduling script '{script.get('name')}' for endpoint {endpoint.get('endpointId')}...")
+        response = self.api.schedule_script(
+            template_id=str(script.get("id")),
+            template_type=str(script.get("templateType", "fusionscript")),
+            endpoint_ids=[str(endpoint.get("endpointId"))],
+            name=task_name,
+            user_parameters=user_parameters,
+        )
+        self.console.print("[green]Task scheduled successfully.[/green]")
+        self.console.print(response)
+
+        task_id = response.get("taskID") or response.get("taskId")
+        if not task_id:
+            self.console.print("[yellow]No task ID returned; skipping status watch.[/yellow]")
+            return
+
+        if args.no_watch:
+            self.console.print("[cyan]Skipping task monitoring (--no-watch set).[/cyan]")
+            return
+
+        submitted_dt = self._parse_datetime(response.get("createdOn")) or datetime.now(timezone.utc)
+        self._wait_for_task_completion(task_id, submitted_dt=submitted_dt)
+
+    def _resolve_endpoint_identifier(self, company_id: str, identifier: str) -> Optional[Dict[str, Any]]:
+        endpoints = self._load_endpoints(company_id)
+        identifier = identifier.strip()
+        if not identifier:
+            return None
+        identifier_lower = identifier.lower()
+        matches: List[Dict[str, Any]] = []
+        for endpoint in endpoints:
+            for alias in self._endpoint_aliases(endpoint):
+                if alias.lower() == identifier_lower:
+                    matches.append(endpoint)
+        if not matches and identifier.isdigit():
+            index = int(identifier)
+            if 1 <= index <= len(endpoints):
+                matches.append(endpoints[index - 1])
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Endpoint identifier '{identifier}' is ambiguous")
+        return None
+
+    def _resolve_script_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        scripts = self._load_scripts()
+        identifier = identifier.strip()
+        if not identifier:
+            return None
+        identifier_lower = identifier.lower()
+        matches: List[Dict[str, Any]] = []
+        for script in scripts:
+            aliases = [str(script.get("id", "")), str(script.get("name", ""))]
+            for alias in aliases:
+                if alias and alias.lower() == identifier_lower:
+                    matches.append(script)
+        if not matches and identifier.isdigit():
+            index = int(identifier)
+            if 1 <= index <= len(scripts):
+                matches.append(scripts[index - 1])
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Script identifier '{identifier}' is ambiguous")
+        return None
+
+    def _parse_headless_parameters(self, args: Namespace) -> Optional[Any]:
+        params: Optional[Any] = None
+
+        if args.params_file:
+            data = self._parse_json(Path(args.params_file).read_text())
+            if data is None:
+                raise ValueError(f"Could not parse JSON from {args.params_file}")
+            params = data
+
+        if args.params_json:
+            data = self._parse_json(args.params_json)
+            if data is None:
+                raise ValueError("Could not parse JSON provided via --params-json")
+            params = self._merge_parameters(params, data)
+
+        for item in args.param or []:
+            if "=" not in item:
+                raise ValueError(f"Invalid --param value '{item}'. Expected key=value format")
+            key, value = item.split("=", 1)
+            parsed = self._parse_json(value)
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                raise ValueError("Cannot combine --param entries with non-object parameters")
+            params[key] = parsed if parsed is not None else value
+
+        return params
+
+    def _merge_parameters(self, base: Optional[Any], data: Any) -> Any:
+        if base is None:
+            return data
+        if isinstance(base, dict) and isinstance(data, dict):
+            merged = dict(base)
+            merged.update(data)
+            return merged
+        if isinstance(base, list) and isinstance(data, list):
+            return data  # prefer latest list provided
+        return data
+
+    def _collect_headless_parameters(self, script: Dict[str, Any], provided: Optional[Any]) -> Optional[Any]:
+        if provided is not None:
+            return provided
+        if not script.get("hasParameters"):
+            return None
+        definition = self._find_task_definition_for_script(script)
+        sample = None
+        if definition:
+            sample = self._parse_json(definition.get("userParameters"))
+        if sample is not None:
+            self.console.print("[cyan]Using sample parameters from task definition.[/cyan]")
+            return sample
+        raise ValueError(
+            "Script requires parameters. Provide them with --params-json, --params-file, or --param."
+        )
+
     def _convert_parameter_value(self, raw: str, schema: Dict[str, Any]) -> Any:
         param_type = schema.get("type") or "string"
         enum = schema.get("enum") if isinstance(schema.get("enum"), list) else None
@@ -1130,9 +1276,40 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help="Display masked login flow and HTTP request/response debugging output.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run a single script execution without the interactive prompt.",
+    )
+    parser.add_argument("--company", help="Company identifier (ID or friendly name) for headless mode.")
+    parser.add_argument("--endpoint", help="Endpoint identifier (ID or friendly name) for headless mode.")
+    parser.add_argument("--script", help="Script identifier (ID or name) for headless mode.")
+    parser.add_argument("--task-name", help="Override the task name when running headless.")
+    parser.add_argument("--params-json", help="Script parameters as a JSON string for headless mode.")
+    parser.add_argument("--params-file", help="Path to a JSON file containing script parameters.")
+    parser.add_argument(
+        "--param",
+        action="append",
+        help="Specify an individual script parameter as key=value (repeatable).",
+    )
+    parser.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Skip waiting for task completion in headless mode.",
+    )
     args = parser.parse_args(argv)
 
     app = AsioCommandsApp(login_debug=args.debug)
+    if args.headless:
+        try:
+            app.run_headless(args)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            app.console.print(f"[red]Error:[/red] {exc}")
+            raise SystemExit(1) from exc
+        return
+
     app.run()
 
 
