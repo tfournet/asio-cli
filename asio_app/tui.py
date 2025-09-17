@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import time
 from datetime import datetime, timezone
@@ -45,6 +46,7 @@ class AsioCommandsApp:
         self._endpoints_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._endpoint_details: Dict[str, Dict[str, Any]] = {}
         self._scripts_cache: List[Dict[str, Any]] = []
+        self._task_definitions: Optional[List[Dict[str, Any]]] = None
         if api is None:
             self.api = AsioApiClient(
                 login_debug=login_debug,
@@ -231,12 +233,13 @@ class AsioCommandsApp:
             return
         default_name = script.get("name", "Automation Task")
         task_name = self.session.prompt(f"Task name [{default_name}]: ") or default_name
-        submitted_at = time.time()
+        user_parameters = self._collect_script_parameters(script)
         response = self.api.schedule_script(
             template_id=str(script.get("id")),
             template_type=str(script.get("templateType", "fusionscript")),
             endpoint_ids=[str(endpoint.get("endpointId"))],
             name=task_name,
+            user_parameters=user_parameters,
         )
         self._debug_print("run:schedule_response", response)
         task_id = response.get("taskID") or response.get("taskId")
@@ -245,7 +248,8 @@ class AsioCommandsApp:
             self.console.print(f"Task ID: {task_id}")
         self.console.print(response)
         if task_id:
-            self._wait_for_task_completion(task_id, submitted_at=submitted_at)
+            submitted_dt = self._parse_datetime(response.get("createdOn")) or datetime.now(timezone.utc)
+            self._wait_for_task_completion(task_id, submitted_dt=submitted_dt)
 
     def _handle_summary(self, args: List[str]) -> None:
         if not args:
@@ -364,7 +368,7 @@ Commands:
   companies            List companies your credentials can access.
   endpoints <company>  List endpoints for a company (ID, name, or friendly name).
   scripts              List available automation scripts.
-  run                  Interactive wizard to schedule a script and watch results.
+  run                  Interactive wizard to schedule a script, collect parameters, and watch results.
   summary <task_id>    Show execution summary for a task.
   results <task> <instance>  Show detailed results for a task instance.
   scopecheck           Discover the maximal scope set your credentials support.
@@ -599,6 +603,50 @@ Commands:
         ]
         return [alias for alias in aliases if alias]
 
+    def _load_task_definitions(self) -> List[Dict[str, Any]]:
+        if self._task_definitions is None:
+            while True:
+                try:
+                    self._task_definitions = self.api.list_task_definitions()
+                    break
+                except RateLimitError as err:
+                    self._handle_rate_limit(err)
+                except Exception as exc:  # noqa: BLE001
+                    self.console.print(f"[red]Failed to load task definitions: {exc}[/red]")
+                    self._task_definitions = []
+                    break
+        return self._task_definitions
+
+    def _find_task_definition_for_script(self, script: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        script_id = str(script.get("id", ""))
+        script_name = str(script.get("name", ""))
+        definitions = self._load_task_definitions()
+        for definition in definitions:
+            template_id = str(definition.get("templateID") or definition.get("templateId") or "")
+            if template_id and template_id == script_id:
+                return definition
+        for definition in definitions:
+            definition_id = str(definition.get("id", ""))
+            if definition_id and definition_id == script_id:
+                return definition
+        for definition in definitions:
+            if script_name and definition.get("name") == script_name:
+                return definition
+        return None
+
+    def _collect_script_parameters(self, script: Dict[str, Any]) -> Optional[Any]:
+        if not script.get("hasParameters"):
+            return None
+        definition = self._find_task_definition_for_script(script)
+        schema = None
+        sample = None
+        if definition:
+            schema = self._parse_json(definition.get("JSONSchema") or definition.get("jsonSchema"))
+            sample = self._parse_json(definition.get("userParameters"))
+        if schema and isinstance(schema, dict) and schema.get("properties"):
+            return self._prompt_parameters_from_schema(schema, sample)
+        return self._prompt_parameters_manual(sample)
+
     # ------------------------------------------------------------------
     # Task polling helpers
     def _wait_for_task_completion(
@@ -607,15 +655,10 @@ Commands:
         *,
         poll_interval: float = 1.0,
         timeout: float = 600.0,
-        submitted_at: Optional[float] = None,
+        submitted_dt: Optional[datetime] = None,
     ) -> None:
         self.console.print("[cyan]Waiting for task completion...[/cyan]")
         start = time.time()
-        submitted_dt = (
-            datetime.fromtimestamp(submitted_at, timezone.utc)
-            if submitted_at is not None
-            else None
-        )
         last_statuses: Dict[str, str] = {}
         terminal_statuses = {
             "success",
@@ -776,6 +819,21 @@ Commands:
                 return int(value)
         return 0
 
+    def _parse_json(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return json.loads(text)
+            except ValueError:
+                return None
+        return None
+
     def _determine_start_time(self, summary_instance: Dict[str, Any], results: Dict[str, Any]) -> Optional[datetime]:
         candidate_keys = [
             "ExecutedOn",
@@ -878,6 +936,177 @@ Commands:
             parts.append(f"{minutes}m")
         parts.append(f"{sec}s")
         return " ".join(parts)
+
+    def _prompt_parameters_from_schema(self, schema: Dict[str, Any], sample: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return self._prompt_parameters_manual(sample)
+        required = set(schema.get("required", [])) if isinstance(schema.get("required"), list) else set()
+        sample_values = sample if isinstance(sample, dict) else {}
+        params: Dict[str, Any] = {}
+        for name, prop in properties.items():
+            if not isinstance(prop, dict):
+                continue
+            description = prop.get("description") or ""
+            param_type = prop.get("type") or "string"
+            enum = prop.get("enum") if isinstance(prop.get("enum"), list) else None
+            default = sample_values.get(name, prop.get("default"))
+            default_display = None
+            if isinstance(default, (dict, list)):
+                default_display = json.dumps(default)
+            elif default is not None:
+                default_display = str(default)
+            while True:
+                prompt_parts = [name]
+                if description:
+                    prompt_parts.append(f"- {description}")
+                type_segment = param_type
+                if enum:
+                    type_segment += f", options: {', '.join(map(str, enum))}"
+                prompt_parts.append(f"[{type_segment}]")
+                if default_display is not None:
+                    prompt_parts.append(f"(default: {default_display})")
+                prompt_text = " ".join(prompt_parts) + ": "
+                raw = self.session.prompt(prompt_text)
+                if not raw.strip():
+                    if default is not None:
+                        value = default
+                    elif name in required:
+                        self.console.print(f"[red]{name} is required.[/red]")
+                        continue
+                    else:
+                        value = None
+                else:
+                    try:
+                        value = self._convert_parameter_value(raw, prop)
+                    except ValueError as exc:
+                        self.console.print(f"[red]{exc}[/red]")
+                        continue
+                if value is not None:
+                    params[name] = value
+                elif name in required:
+                    self.console.print(f"[red]{name} is required.[/red]")
+                    continue
+                break
+        extra_json = self.session.prompt("Additional parameters as JSON (leave blank to continue): ")
+        if extra_json.strip():
+            extra = self._parse_json(extra_json)
+            if isinstance(extra, dict):
+                params.update(extra)
+            else:
+                self.console.print("[yellow]Ignored additional parameters (invalid JSON).[/yellow]")
+        return params or None
+
+    def _prompt_parameters_manual(self, sample: Any) -> Optional[Any]:
+        params: Dict[str, Any] = {}
+        sample_dict = sample if isinstance(sample, dict) else None
+        sample_list = sample if isinstance(sample, list) else None
+
+        if sample_dict:
+            self.console.print("[cyan]Provide values for the following parameters (press Enter to keep defaults).[/cyan]")
+            for key, default in sample_dict.items():
+                default_display = (
+                    json.dumps(default)
+                    if isinstance(default, (dict, list))
+                    else str(default) if default is not None else None
+                )
+                prompt = f"{key}"
+                if default_display is not None:
+                    prompt += f" (default: {default_display})"
+                prompt += ": "
+                raw = self.session.prompt(prompt)
+                if not raw.strip():
+                    if default is not None:
+                        params[key] = default
+                    continue
+                parsed = self._parse_json(raw)
+                params[key] = parsed if parsed is not None else raw
+        elif sample_list:
+            pretty = json.dumps(sample_list, indent=2)
+            self.console.print("[cyan]Sample parameter list:\n" + pretty + "[/cyan]")
+            if self._prompt_yes_no("Use the sample list as-is?", default=False):
+                return sample_list
+            self.console.print("[cyan]Enter each list item (blank line to finish).[/cyan]")
+            items: List[Any] = []
+            while True:
+                raw = self.session.prompt(f"Item {len(items) + 1}: ")
+                if not raw.strip():
+                    break
+                parsed = self._parse_json(raw)
+                items.append(parsed if parsed is not None else raw)
+            return items or None
+        else:
+            self.console.print(
+                "[cyan]This script requires parameters. Enter key/value pairs (blank name to finish).[/cyan]"
+            )
+
+        while True:
+            if not self._prompt_yes_no("Add another parameter?", default=False):
+                break
+            name = self.session.prompt("Parameter name: ").strip()
+            if not name:
+                break
+            value_raw = self.session.prompt(f"{name} value: ")
+            parsed = self._parse_json(value_raw)
+            params[name] = parsed if parsed is not None else value_raw
+
+        if not params and sample_dict:
+            return sample_dict
+        return params or None
+
+    def _convert_parameter_value(self, raw: str, schema: Dict[str, Any]) -> Any:
+        param_type = schema.get("type") or "string"
+        enum = schema.get("enum") if isinstance(schema.get("enum"), list) else None
+        if enum:
+            for option in enum:
+                if raw == option:
+                    return option
+                if isinstance(option, (int, float)) and raw == str(option):
+                    return option
+            for option in enum:
+                if isinstance(option, str) and raw.strip().lower() == option.lower():
+                    return option
+            raise ValueError(f"Value must be one of: {', '.join(map(str, enum))}")
+        if param_type == "boolean":
+            lowered = raw.strip().lower()
+            if lowered in {"true", "t", "yes", "y", "1"}:
+                return True
+            if lowered in {"false", "f", "no", "n", "0"}:
+                return False
+            raise ValueError("Enter true/false")
+        if param_type == "integer":
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise ValueError("Enter an integer") from exc
+        if param_type == "number":
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise ValueError("Enter a numeric value") from exc
+        if param_type == "array":
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, list):
+                return parsed
+            raise ValueError("Enter a JSON array")
+        if param_type == "object":
+            parsed = self._parse_json(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            raise ValueError("Enter a JSON object")
+        return raw
+
+    def _prompt_yes_no(self, message: str, *, default: bool = False) -> bool:
+        suffix = " [Y/n]" if default else " [y/N]"
+        while True:
+            raw = self.session.prompt(message + suffix + " ").strip().lower()
+            if not raw:
+                return default
+            if raw in {"y", "yes"}:
+                return True
+            if raw in {"n", "no"}:
+                return False
+            self.console.print("[red]Please enter y or n.[/red]")
 
     def _extract_instance_output(self, results: Any) -> Optional[str]:
         entries = self._extract_results_entries(results)

@@ -308,6 +308,7 @@ class AsioApiClient:
         name: Optional[str] = None,
         resources_type: str = "Both",
         schedule: Optional[Dict[str, Any]] = None,
+        user_parameters: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Schedule a script execution on one or more endpoints."""
         payload = {
@@ -324,6 +325,8 @@ class AsioApiClient:
                 "scheduleType": "TIME",
             },
         }
+        if user_parameters not in (None, {}):
+            payload["userParameters"] = user_parameters
         return self._post("/api/platform/v1/automation/endpoints/schedule-tasks", json=payload)
 
     def get_task_instances_summary(self, task_id: str) -> Dict[str, Any]:
@@ -333,6 +336,17 @@ class AsioApiClient:
     def get_task_instance_results(self, task_id: str, instance_id: str) -> Dict[str, Any]:
         path = f"/api/platform/v1/automation/tasks/{task_id}/instances/{instance_id}/results"
         return self._get(path)
+
+    def list_task_definitions(self) -> List[Dict[str, Any]]:
+        data = self._get("/api/platform/v1/automation/tasks")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("tasks", "items", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
 
 
 __all__ = ["AsioApiClient", "RateLimitError"]

@@ -33,7 +33,7 @@ You will see an `asio>` prompt. Available commands:
 - `companies` — list company IDs and names (prints raw payloads when `debug` mode is enabled).
 - `endpoints <company>` — list managed endpoints by company ID, name, or friendly name.
 - `scripts` — display available automation scripts.
-- `run` — guided wizard to pick a company, endpoint (ID or friendly name), and script, then schedule it while streaming task status and reporting completion time.
+- `run` — guided wizard to pick a company, endpoint (ID or friendly name), and script, then schedule it while prompting for script parameters (when required), streaming task status, and reporting completion time.
 - `summary <task_id>` — view task execution summary.
 - `results <task_id> <instance_id>` — inspect detailed task outcomes.
 - `scopecheck` — discover the largest scope set your credentials can use for token generation.
