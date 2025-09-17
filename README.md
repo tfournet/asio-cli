@@ -40,3 +40,5 @@ You will see an `asio>` prompt. Available commands:
 - `help`, `quit`, `exit` — helper commands.
 
 The TUI prints API responses using Rich tables, so you can copy IDs into follow-up commands. Toggle `debug` within the shell to stream full HTTP requests/responses (with sensitive headers masked). For deeper troubleshooting or payload examples, refer back to `example.md`.
+
+![Asio Commands TUI screenshot](./asio-tui-screenshot.png)
